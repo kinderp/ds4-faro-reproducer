@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "ds4_base_commit": "54b36ed9ba42da31b24f2d1a5feb075c2475dbb1",
+  "block_size": 6,
+  "relations": {
+    "oracle_candidates": "VALID",
+    "frontier_position": "MATCH",
+    "compressor_counters": "MATCH",
+    "raw_kv_state": "DIFFERENT",
+    "attention_compressor_state": "DIFFERENT",
+    "index_compressor_state": "DIFFERENT",
+    "replay_safe_final_logits": "EXACT MATCH"
+  },
+  "allowed_mismatch_ranges": {
+    "raw_kv_layers": [1, 43],
+    "attention_compressor_layers": [1, 41],
+    "index_compressor_layers": [1, 21]
+  },
+  "notes": [
+    "Checksum values may differ across hardware or toolchains.",
+    "The required property is the MATCH or DIFFERENT relation.",
+    "The benchmark is warm, bounded, oracle and draft-free."
+  ]
+}
