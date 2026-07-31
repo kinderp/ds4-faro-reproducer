@@ -1,6 +1,6 @@
 # Publication checklist
 
-Status after local verification and before private-remote verification:
+Status after local and private-remote verification:
 
 | Gate | Status | Evidence |
 | --- | --- | --- |
@@ -14,10 +14,10 @@ Status after local verification and before private-remote verification:
 | checksums | PASS | SHA-256 manifest generated after local final content |
 | documentation | PASS | README and seven focused technical documents reviewed |
 | aggregate results | PASS | all JSON parsed; all CSV rows are rectangular |
-| fresh Git history | PENDING | repository not initialised yet |
+| fresh Git history | PASS | four reviewable commits before remote qualification; no FARO history |
 | no model | PASS | no GGUF, support model, weight file or model symlink |
 | no private data | PASS | no private trace, prompt/output capture, token IDs or state dumps |
-| private GitHub clone audit | PENDING | remote not created yet |
+| private GitHub clone audit | PASS | fresh clone, full-history scan, patch, build and bounded run pass |
 
 The repository must remain private until the exact phrase
 `PUBBLICA REPRODUCER` is received.
