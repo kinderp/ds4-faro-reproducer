@@ -1,0 +1,966 @@
+diff --git a/ds4.c b/ds4.c
+index 2496319..64faea3 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -16816,7 +16816,10 @@ static bool metal_graph_alloc_raw_cap(
+     const bool enable_splitkv_spec = metal_graph_cuda_splitkv_spec_requested();
+     const bool enable_splitkv_batch_verify =
+         enable_splitkv_spec && metal_graph_cuda_splitkv_spec_batch_verify_requested();
+-    const bool enable_spec_logits = enable_mtp || enable_splitkv_batch_verify;
++    const bool enable_faro_oracle_verify =
++        getenv("FARO_GATE4C1_ORACLE_VERIFIER") != NULL;
++    const bool enable_spec_logits =
++        enable_mtp || enable_splitkv_batch_verify || enable_faro_oracle_verify;
+     const bool enable_prefix1_snapshot = enable_mtp || enable_splitkv_spec;
+     const bool enable_frontier_snapshot =
+         enable_mtp ||
+@@ -16824,7 +16827,8 @@ static bool metal_graph_alloc_raw_cap(
+         (metal_graph_cuda_greedy_splitkv_requested() &&
+          metal_graph_cuda_greedy_splitkv_fallback_requested()) ||
+         (metal_graph_cuda_greedy_vec4_requested() &&
+-         metal_graph_cuda_greedy_vec4_fallback_requested());
++         metal_graph_cuda_greedy_vec4_fallback_requested()) ||
++        enable_faro_oracle_verify;
+     if (g->cuda_tp_decode && metal_graph_cuda_tp_partner_tier(0) < 0) {
+         fprintf(stderr,
+                 "ds4: CUDA tensor parallelism requires an even multi-GPU placement; "
+@@ -33918,6 +33922,10 @@ static bool metal_graph_verify_suffix_tops_impl(
+ 
+     const double upload_t0 = timing ? now_sec() : 0.0;
+     bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, start, n_tokens);
++    if (ok && g->ssd_streaming) {
++        g->streaming_static_decode_map_current = false;
++        ok = metal_graph_stream_map_token(model, weights);
++    }
+     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
+                                                          metal_graph_prefill_tokens(g),
+                                                          model,
+@@ -33942,6 +33950,128 @@ static bool metal_graph_verify_suffix_tops_impl(
+         metal_graph_stream_prefill_selected_profile_reset(g);
+     }
+ 
++    /*
++     * The resident verifier can keep all layers in one command stream. SSD
++     * streaming cannot: each layer needs the bounded decode-only mapping and
++     * selected-expert cache service already used by layer-major prefill.
++     * Candidate rows remain batched, so repeated experts are loaded once and
++     * applied to every row that selected them.
++     */
++    if (g->ssd_streaming) {
++        const bool batch_selected_addr =
++            metal_graph_stream_prefill_batch_selected_addr_enabled(
++                    g, weights, n_tokens) ||
++            metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(
++                    g, weights, n_tokens);
++        if (!batch_selected_addr) {
++            fprintf(stderr,
++                    "ds4: SSD verifier requires selected-address batch "
++                    "streaming for %u candidates\n",
++                    n_tokens);
++            g->spec_capture_prefix1 = saved_capture;
++            return false;
++        }
++
++        const double stream_layer_t0 = timing ? now_sec() : 0.0;
++        const bool stream_capture_active =
++            capture_dspark_hidden &&
++            metal_graph_dspark_capture_verified_suffix_begin(
++                    g, start, n_tokens, true);
++        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
++            g->streaming_static_decode_map_current = false;
++            ok = metal_graph_stream_map_layer_decode(model, weights, il);
++            if (!ok) break;
++            if (il + 1u < DS4_N_LAYER) {
++                metal_graph_stream_readahead_layer_decode(
++                        model, weights, il + 1u);
++            } else {
++                metal_graph_stream_readahead_output(model, weights);
++            }
++            if (ok) ok = ds4_gpu_begin_commands() != 0;
++            if (ok) {
++                ok = metal_graph_encode_layer_batch(g,
++                                                    model,
++                                                    &weights->layer[il],
++                                                    il,
++                                                    start,
++                                                    n_tokens);
++            }
++            if (ok && stream_capture_active) {
++                ok = metal_graph_dspark_capture_verified_suffix_layer(
++                        g, il, start, n_tokens);
++            }
++            if (ok) ok = ds4_gpu_end_commands() != 0;
++            else (void)ds4_gpu_synchronize();
++            if (ok && selected_profile) {
++                ok = metal_graph_selected_profile_layer_impl(
++                        g,
++                        &weights->layer[il],
++                        il,
++                        n_tokens,
++                        "FARO SSD verifier selected profile");
++            }
++        }
++        if (timing) {
++            timing->layer_ms +=
++                (now_sec() - stream_layer_t0) * 1000.0;
++        }
++        if (!ok) {
++            g->spec_capture_prefix1 = saved_capture;
++            if (stream_capture_active) {
++                metal_graph_dspark_capture_invalidate(g);
++            }
++            return false;
++        }
++
++#ifdef __APPLE__
++        ds4_gpu_release_zero_prefix_prefill_mask_cache();
++#endif
++        const double stream_head_t0 = timing ? now_sec() : 0.0;
++        g->streaming_static_decode_map_current = false;
++        ok = metal_graph_stream_map_output(model, weights);
++        if (ok) ok = ds4_gpu_begin_commands() != 0;
++        if (ok) {
++            ok = metal_graph_encode_output_head_batch(g,
++                                                      model,
++                                                      weights,
++                                                      n_tokens,
++                                                      weights->output->dim[1]);
++        }
++        if (ok) {
++            if (top_rows == 1) {
++                ok = ds4_gpu_argmax_tensor(metal_graph_comp_selected(g),
++                                           g->spec_logits,
++                                           DS4_N_VOCAB) != 0;
++            } else if (top_rows) {
++                ok = ds4_gpu_indexer_topk_tensor(
++                             metal_graph_comp_selected(g),
++                             g->spec_logits,
++                             DS4_N_VOCAB,
++                             top_rows,
++                             1) != 0;
++            }
++        }
++        if (ok) ok = ds4_gpu_end_commands() != 0;
++        else (void)ds4_gpu_synchronize();
++        g->spec_capture_prefix1 = saved_capture;
++        if (timing) {
++            timing->head_ms +=
++                (now_sec() - stream_head_t0) * 1000.0;
++            timing->fused_head = false;
++        }
++        if (!ok) {
++            if (stream_capture_active) {
++                metal_graph_dspark_capture_invalidate(g);
++            }
++            return false;
++        }
++        if (selected_profile) {
++            metal_graph_selected_profile_summary_impl(
++                    g, "FARO SSD verifier selected profile");
++        }
++        goto verify_readback;
++    }
++
+     /* Under TP, verify every speculative block against the two resident
+      * expert halves. Both ranks encode identically, so one batch gate per
+      * layer reconstructs the routed result while preserving their KV state. */
+@@ -34061,6 +34191,8 @@ static bool metal_graph_verify_suffix_tops_impl(
+         else (void)ds4_gpu_synchronize();
+         if (timing) timing->head_ms += (now_sec() - head_t0) * 1000.0;
+     }
++verify_readback:
++    ;
+     const double read_t0 = timing ? now_sec() : 0.0;
+     if (ok && top_rows) {
+         ok = ds4_gpu_tensor_read(metal_graph_comp_selected(g),
+@@ -64848,6 +64980,646 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+ #endif
+ }
+ 
++#ifndef FARO_GATE4C2A_TIMING
++#define FARO_GATE4C2A_TIMING 1
++#endif
++
++#if FARO_GATE4C2A_TIMING
++#define FARO_GATE4C2A_NOW() now_sec()
++#define FARO_GATE4C2A_ELAPSED_MS(start_) \
++    ((now_sec() - (start_)) * 1000.0)
++#else
++#define FARO_GATE4C2A_NOW() 0.0
++#define FARO_GATE4C2A_ELAPSED_MS(start_) ((void)(start_), 0.0)
++#endif
++
++#ifndef DS4_NO_GPU
++typedef struct faro_gate4c2a_state_signatures {
++    uint64_t raw_kv[DS4_MAX_LAYER];
++    uint64_t attn_state[DS4_MAX_LAYER];
++    uint64_t index_state[DS4_MAX_LAYER];
++    uint32_t checkpoint_len;
++    uint32_t mtp_n_raw;
++    uint32_t dspark_cache_start;
++    uint32_t dspark_cache_token_start;
++    uint32_t dspark_cache_len;
++} faro_gate4c2a_state_signatures;
++
++static uint64_t faro_gate4c2a_hash_update(
++        uint64_t hash, const void *data, size_t size) {
++    const unsigned char *p = data;
++    for (size_t i = 0; i < size; i++) {
++        hash ^= (uint64_t)p[i];
++        hash *= 1099511628211ull;
++    }
++    return hash;
++}
++
++static bool faro_gate4c2a_hash_tensor_range(
++        ds4_gpu_tensor *tensor,
++        uint64_t offset,
++        uint64_t bytes,
++        uint64_t *hash) {
++    if (!tensor || !hash || bytes == 0u) return false;
++    void *buffer = xmalloc((size_t)bytes);
++    const bool ok =
++        ds4_gpu_tensor_read(tensor, offset, buffer, bytes) != 0;
++    if (ok) {
++        *hash = faro_gate4c2a_hash_update(
++                *hash, buffer, (size_t)bytes);
++    }
++    free(buffer);
++    return ok;
++}
++
++/*
++ * Diagnostic-only signatures. They read only the newly written raw KV rows
++ * and the small recurrent compressor frontiers; they never enter a timing
++ * sample. Hashes stay inside the process and only mismatch counts are
++ * exported.
++ */
++static bool faro_gate4c2a_capture_state_signatures(
++        ds4_session *s,
++        uint32_t start,
++        uint32_t block_size,
++        faro_gate4c2a_state_signatures *out) {
++    if (!s || !out || block_size == 0u) return false;
++    memset(out, 0, sizeof(*out));
++    ds4_gpu_graph *g = &s->graph;
++    out->checkpoint_len = (uint32_t)s->checkpoint.len;
++    out->mtp_n_raw = g->mtp_n_raw;
++    out->dspark_cache_start = g->dspark_cache_start;
++    out->dspark_cache_token_start = g->dspark_cache_token_start;
++    out->dspark_cache_len = g->dspark_cache_len;
++    const uint64_t raw_row_bytes =
++        (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
++    bool ok = true;
++    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
++        if (g->layer_raw_cache[il]) {
++            uint64_t hash = 1469598103934665603ull;
++            const uint32_t row0 = start % g->raw_cap;
++            const uint32_t first_rows =
++                block_size < g->raw_cap - row0
++                    ? block_size : g->raw_cap - row0;
++            ok = faro_gate4c2a_hash_tensor_range(
++                    g->layer_raw_cache[il],
++                    (uint64_t)row0 * raw_row_bytes,
++                    (uint64_t)first_rows * raw_row_bytes,
++                    &hash);
++            if (ok && first_rows < block_size) {
++                ok = faro_gate4c2a_hash_tensor_range(
++                        g->layer_raw_cache[il],
++                        0,
++                        (uint64_t)(block_size - first_rows) *
++                            raw_row_bytes,
++                        &hash);
++            }
++            out->raw_kv[il] = hash;
++        }
++        const uint32_t ratio = ds4_layer_compress_ratio(il);
++        if (!ok || ratio == 0u) continue;
++        uint64_t attn_hash = 1469598103934665603ull;
++        const uint64_t attn_bytes =
++            ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
++        ok = faro_gate4c2a_hash_tensor_range(
++                g->layer_attn_state_kv[il], 0, attn_bytes,
++                &attn_hash) &&
++             faro_gate4c2a_hash_tensor_range(
++                g->layer_attn_state_score[il], 0, attn_bytes,
++                &attn_hash);
++        out->attn_state[il] = attn_hash;
++        if (!ok || ratio != 4u) continue;
++        uint64_t index_hash = 1469598103934665603ull;
++        const uint64_t index_bytes =
++            ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
++        ok = faro_gate4c2a_hash_tensor_range(
++                g->layer_index_state_kv[il], 0, index_bytes,
++                &index_hash) &&
++             faro_gate4c2a_hash_tensor_range(
++                g->layer_index_state_score[il], 0, index_bytes,
++                &index_hash);
++        out->index_state[il] = index_hash;
++    }
++    return ok;
++}
++#endif
++
++int ds4_session_oracle_verify_block(
++        ds4_session *s,
++        uint32_t block_size,
++        bool cold_cache,
++        bool deep_check,
++        ds4_oracle_verify_result *out,
++        char *err,
++        size_t errlen) {
++#ifdef DS4_NO_GPU
++    (void)s;
++    (void)block_size;
++    (void)cold_cache;
++    (void)deep_check;
++    (void)out;
++    snprintf(err, errlen, "oracle verifier requires a GPU build");
++    return 1;
++#else
++    if (!s || !out || block_size == 0 || block_size > 16u) {
++        snprintf(err, errlen, "invalid oracle verifier arguments");
++        return 1;
++    }
++    ds4_engine *e = s->engine;
++    if (!e || e->backend == DS4_BACKEND_CPU || !s->checkpoint_valid ||
++        !s->graph.ssd_streaming ||
++        block_size > s->graph.prefill_cap ||
++        (uint64_t)s->checkpoint.len + block_size + 1u >
++            (uint64_t)s->ctx_size) {
++        snprintf(err, errlen,
++                 "oracle verifier requires a valid SSD-streaming Metal "
++                 "session with context room");
++        return 1;
++    }
++
++    memset(out, 0, sizeof(*out));
++    out->timing_schema_version = 2u;
++    out->timing_breakdown = FARO_GATE4C2A_TIMING != 0;
++    out->block_size = block_size;
++    out->cold_cache = cold_cache;
++    const int start = s->checkpoint.len;
++    const size_t logits_bytes = (size_t)DS4_N_VOCAB * sizeof(float);
++    float *start_logits = xmalloc(logits_bytes);
++    float *sequential_logits = xmalloc(logits_bytes);
++    float *batch_logits = xmalloc(logits_bytes);
++    float *first_step_logits = deep_check ? xmalloc(logits_bytes) : NULL;
++    float *batch_cont_logits = deep_check ? xmalloc(logits_bytes) : NULL;
++    float *seq_cont_logits = deep_check ? xmalloc(logits_bytes) : NULL;
++    int oracle[16] = {0};
++    int row_tops[16] = {0};
++    uint32_t sequential_n_comp[DS4_N_LAYER];
++    uint32_t sequential_n_index_comp[DS4_N_LAYER];
++    memset(sequential_n_comp, 0, sizeof(sequential_n_comp));
++    memset(sequential_n_index_comp, 0,
++           sizeof(sequential_n_index_comp));
++    faro_gate4c2a_state_signatures sequential_signatures;
++    faro_gate4c2a_state_signatures batch_signatures;
++    memset(&sequential_signatures, 0, sizeof(sequential_signatures));
++    memset(&batch_signatures, 0, sizeof(batch_signatures));
++    bool sequential_signature_ok = false;
++    memcpy(start_logits, s->logits, logits_bytes);
++
++    ds4_spec_frontier original;
++    memset(&original, 0, sizeof(original));
++    bool have_original = spec_frontier_snapshot(&original, s);
++    bool ok = have_original;
++    for (uint32_t i = 0; ok && i < block_size; i++) {
++        oracle[i] = sample_argmax(s->logits, DS4_N_VOCAB);
++        ok = oracle[i] >= 0 &&
++             ds4_session_eval(s, oracle[i], err, errlen) == 0;
++        if (ok && deep_check && i == 0) {
++            memcpy(first_step_logits, s->logits, logits_bytes);
++        }
++    }
++    if (ok) memcpy(sequential_logits, s->logits, logits_bytes);
++    if (ok) {
++        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
++            sequential_n_comp[il] = s->graph.layer_n_comp[il];
++            sequential_n_index_comp[il] =
++                s->graph.layer_n_index_comp[il];
++        }
++    }
++    if (ok && deep_check) {
++        sequential_signature_ok =
++            faro_gate4c2a_capture_state_signatures(
++                    s, (uint32_t)start, block_size,
++                    &sequential_signatures);
++    }
++
++    s->checkpoint.len = start;
++    ds4_session_dspark_capture_invalidate(s);
++    if (ok) ok = spec_frontier_restore(&original, s);
++    if (ok) {
++        memcpy(s->logits, start_logits, logits_bytes);
++        s->checkpoint_valid = true;
++    }
++    if (!ok) {
++        snprintf(err, errlen,
++                 "failed to generate or restore oracle continuation");
++        goto oracle_verify_cleanup;
++    }
++
++    ds4_spec_frontier measured;
++    memset(&measured, 0, sizeof(measured));
++    const double total_t0 = now_sec();
++    const double snapshot_t0 = FARO_GATE4C2A_NOW();
++    ok = spec_frontier_snapshot(&measured, s);
++    out->snapshot_ms = FARO_GATE4C2A_ELAPSED_MS(snapshot_t0);
++    if (!ok) {
++        snprintf(err, errlen, "failed to snapshot verifier frontier");
++        goto oracle_verify_cleanup;
++    }
++
++    if (cold_cache) ds4_gpu_stream_expert_cache_release_resident();
++    metal_graph_stream_prefill_selected_profile_reset(&s->graph);
++    ds4_gpu_stream_expert_cache_stats stats0;
++    ds4_gpu_stream_expert_cache_stats stats1;
++    memset(&stats0, 0, sizeof(stats0));
++    memset(&stats1, 0, sizeof(stats1));
++    ds4_gpu_stream_expert_cache_get_stats(&stats0);
++
++    ds4_verify_suffix_timing verify_timing;
++    memset(&verify_timing, 0, sizeof(verify_timing));
++#if FARO_GATE4C2A_TIMING
++    ds4_verify_suffix_timing *verify_timing_ptr = &verify_timing;
++#else
++    ds4_verify_suffix_timing *verify_timing_ptr = NULL;
++#endif
++    const double verify_t0 = FARO_GATE4C2A_NOW();
++    if (block_size == 1u) {
++        ok = ds4_session_eval(s, oracle[0], err, errlen) == 0;
++        if (ok) memcpy(batch_logits, s->logits, logits_bytes);
++        verify_timing.layer_ms = FARO_GATE4C2A_ELAPSED_MS(verify_t0);
++    } else {
++        const double input_t0 = FARO_GATE4C2A_NOW();
++        for (uint32_t i = 0; i < block_size; i++) {
++            token_vec_push(&s->checkpoint, oracle[i]);
++        }
++        out->input_prepare_ms =
++            FARO_GATE4C2A_ELAPSED_MS(input_t0);
++        ok = metal_graph_verify_suffix_tops(
++                &s->graph,
++                &e->model,
++                &e->weights,
++                &s->checkpoint,
++                (uint32_t)start,
++                block_size,
++                false,
++                false,
++                row_tops,
++                NULL,
++                verify_timing_ptr);
++        if (ok) {
++            const double logits_read_t0 = FARO_GATE4C2A_NOW();
++            ok = metal_graph_read_spec_logits_row(
++                    &s->graph, block_size - 1u, batch_logits);
++            out->final_logits_read_ms =
++                FARO_GATE4C2A_ELAPSED_MS(logits_read_t0);
++        }
++        if (ok) {
++            memcpy(s->logits, batch_logits, logits_bytes);
++            s->checkpoint_valid = true;
++            s->mtp_draft_valid = false;
++        }
++    }
++    out->target_verify_calls = 1;
++    out->upload_ms = verify_timing.upload_ms;
++    out->layer_ms = verify_timing.layer_ms;
++    out->head_ms = verify_timing.head_ms;
++    out->read_ms = verify_timing.read_ms;
++    out->t_core_ms =
++        out->upload_ms + out->layer_ms + out->head_ms;
++    out->expert_requests = 0;
++    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
++        if (e->weights.layer[il].ffn_gate_exps &&
++            e->weights.layer[il].ffn_up_exps &&
++            e->weights.layer[il].ffn_down_exps) {
++            out->expert_requests +=
++                (uint64_t)block_size * DS4_N_EXPERT_USED;
++        }
++    }
++    if (s->graph.prefill_selected_profile_layers != 0) {
++        out->unique_experts =
++            s->graph.prefill_selected_profile_unique;
++    }
++    if (!ok) {
++        s->checkpoint.len = start;
++        (void)spec_frontier_restore(&measured, s);
++        memcpy(s->logits, start_logits, logits_bytes);
++        s->checkpoint_valid = true;
++        spec_frontier_free(&measured);
++        snprintf(err, errlen, "SSD oracle verifier execution failed");
++        goto oracle_verify_cleanup;
++    }
++
++    const double compare_t0 = FARO_GATE4C2A_NOW();
++    out->batch_all_oracle_tokens_accepted =
++        sample_argmax(start_logits, DS4_N_VOCAB) == oracle[0];
++    for (uint32_t i = 1; i < block_size; i++) {
++        if (row_tops[i - 1u] != oracle[i]) {
++            out->batch_all_oracle_tokens_accepted = false;
++            break;
++        }
++    }
++    out->logits_max_abs =
++        max_abs_diff(batch_logits, sequential_logits, DS4_N_VOCAB);
++    out->logits_rmse =
++        rms_abs_diff(batch_logits, sequential_logits, DS4_N_VOCAB);
++    out->batch_final_argmax_equal =
++        sample_argmax(batch_logits, DS4_N_VOCAB) ==
++        sample_argmax(sequential_logits, DS4_N_VOCAB);
++    out->compare_ms = FARO_GATE4C2A_ELAPSED_MS(compare_t0);
++
++    const double state_check_t0 = FARO_GATE4C2A_NOW();
++    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
++        const uint32_t batch_comp = s->graph.layer_n_comp[il];
++        const uint32_t seq_comp = sequential_n_comp[il];
++        const uint32_t comp_delta =
++            batch_comp > seq_comp ? batch_comp - seq_comp :
++                                    seq_comp - batch_comp;
++        if (comp_delta != 0u) {
++            out->compressor_count_mismatch_layers++;
++            if (comp_delta > out->max_compressor_count_delta) {
++                out->max_compressor_count_delta = comp_delta;
++            }
++        }
++        const uint32_t batch_index =
++            s->graph.layer_n_index_comp[il];
++        const uint32_t seq_index = sequential_n_index_comp[il];
++        const uint32_t index_delta =
++            batch_index > seq_index ? batch_index - seq_index :
++                                      seq_index - batch_index;
++        if (index_delta != 0u) {
++            out->index_count_mismatch_layers++;
++            if (index_delta > out->max_index_count_delta) {
++                out->max_index_count_delta = index_delta;
++            }
++        }
++    }
++    out->state_check_ms =
++        FARO_GATE4C2A_ELAPSED_MS(state_check_t0);
++    out->frontier_position_equal =
++        s->checkpoint.len == start + (int)block_size;
++    out->compressor_metadata_equal =
++        out->compressor_count_mismatch_layers == 0u &&
++        out->index_count_mismatch_layers == 0u;
++    out->t_verify_ms = (now_sec() - total_t0) * 1000.0;
++
++    const double diagnostic_t0 =
++        deep_check && block_size > 1u ? now_sec() : 0.0;
++    if (deep_check && sequential_signature_ok) {
++        const bool batch_signature_ok =
++            faro_gate4c2a_capture_state_signatures(
++                    s, (uint32_t)start, block_size,
++                    &batch_signatures);
++        out->state_signature_checked = batch_signature_ok;
++        if (batch_signature_ok) {
++            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
++                if (sequential_signatures.raw_kv[il] !=
++                    batch_signatures.raw_kv[il]) {
++                    out->raw_kv_signature_mismatch_layers++;
++                }
++                if (sequential_signatures.attn_state[il] !=
++                    batch_signatures.attn_state[il]) {
++                    out->attn_state_signature_mismatch_layers++;
++                }
++                if (sequential_signatures.index_state[il] !=
++                    batch_signatures.index_state[il]) {
++                    out->index_state_signature_mismatch_layers++;
++                }
++            }
++            out->auxiliary_frontier_metadata_equal =
++                sequential_signatures.mtp_n_raw ==
++                    batch_signatures.mtp_n_raw &&
++                sequential_signatures.dspark_cache_start ==
++                    batch_signatures.dspark_cache_start &&
++                sequential_signatures.dspark_cache_token_start ==
++                    batch_signatures.dspark_cache_token_start &&
++                sequential_signatures.dspark_cache_len ==
++                    batch_signatures.dspark_cache_len;
++        }
++    }
++    if (deep_check && block_size > 1u) {
++        bool batch_diag_ok = true;
++        const int continuation =
++            sample_argmax(batch_logits, DS4_N_VOCAB);
++        batch_diag_ok =
++            ds4_session_eval(s, continuation, err, errlen) == 0;
++        if (batch_diag_ok) {
++            memcpy(batch_cont_logits, s->logits, logits_bytes);
++        }
++
++        s->checkpoint.len = start;
++        ds4_session_dspark_capture_invalidate(s);
++        batch_diag_ok =
++            spec_frontier_restore(&measured, s) && batch_diag_ok;
++        if (batch_diag_ok) {
++            memcpy(s->logits, start_logits, logits_bytes);
++            s->checkpoint_valid = true;
++        }
++        for (uint32_t i = 0; batch_diag_ok && i < block_size; i++) {
++            batch_diag_ok =
++                ds4_session_eval(s, oracle[i], err, errlen) == 0;
++        }
++        if (batch_diag_ok) {
++            batch_diag_ok =
++                sample_argmax(s->logits, DS4_N_VOCAB) == continuation &&
++                ds4_session_eval(s, continuation, err, errlen) == 0;
++        }
++        if (batch_diag_ok) {
++            memcpy(seq_cont_logits, s->logits, logits_bytes);
++        }
++        out->batch_state_checked = true;
++        out->batch_state_reusable =
++            batch_diag_ok &&
++            sample_argmax(batch_cont_logits, DS4_N_VOCAB) ==
++                sample_argmax(seq_cont_logits, DS4_N_VOCAB);
++    } else if (block_size == 1u) {
++        out->batch_state_checked = true;
++        out->batch_state_reusable = true;
++    }
++    if (diagnostic_t0 != 0.0) {
++        out->diagnostic_ms =
++            (now_sec() - diagnostic_t0) * 1000.0;
++    }
++
++    /*
++     * The generic prefill-batch kernels can accept every oracle token yet
++     * leave a numerically different compressor/KV frontier. Until DS4 has an
++     * exact multi-row commit kernel, full acceptance therefore falls back to
++     * an exact target replay. This is intentionally included in total_ms: a
++     * fast verifier whose state cannot continue safely is not a usable speedup.
++     */
++    const double rollback_t0 = FARO_GATE4C2A_NOW();
++    if (ok && block_size > 1u) {
++        s->checkpoint.len = start;
++        ds4_session_dspark_capture_invalidate(s);
++        ok = spec_frontier_restore(&measured, s);
++        if (ok) {
++            memcpy(s->logits, start_logits, logits_bytes);
++            s->checkpoint_valid = true;
++        }
++    }
++    out->rollback_ms = FARO_GATE4C2A_ELAPSED_MS(rollback_t0);
++    out->t_verify_rollback_ms = out->t_verify_ms + out->rollback_ms;
++
++    const double replay_t0 = FARO_GATE4C2A_NOW();
++    if (ok && block_size > 1u) {
++        uint32_t replayed = 0;
++        for (uint32_t i = 0; ok && i < block_size; i++) {
++            ok = sample_argmax(s->logits, DS4_N_VOCAB) == oracle[i] &&
++                 ds4_session_eval(s, oracle[i], err, errlen) == 0;
++            if (ok) replayed++;
++        }
++        out->used_exact_commit_replay = true;
++        out->exact_replay_tokens = replayed;
++        out->target_verify_calls += replayed;
++    }
++    out->replay_ms = FARO_GATE4C2A_ELAPSED_MS(replay_t0);
++
++    const double final_commit_t0 = FARO_GATE4C2A_NOW();
++    out->all_oracle_tokens_accepted =
++        ok && out->exact_replay_tokens == block_size;
++    if (block_size == 1u) {
++        out->all_oracle_tokens_accepted =
++            ok && out->batch_all_oracle_tokens_accepted;
++    }
++    out->committed_tokens =
++        out->all_oracle_tokens_accepted ? block_size : 0u;
++    out->final_logits_max_abs =
++        max_abs_diff(s->logits, sequential_logits, DS4_N_VOCAB);
++    out->final_logits_rmse =
++        rms_abs_diff(s->logits, sequential_logits, DS4_N_VOCAB);
++    out->continuation_equal =
++        ok &&
++        sample_argmax(s->logits, DS4_N_VOCAB) ==
++            sample_argmax(sequential_logits, DS4_N_VOCAB);
++    out->final_argmax_equal = out->continuation_equal;
++    out->final_commit_ms =
++        FARO_GATE4C2A_ELAPSED_MS(final_commit_t0);
++    out->commit_ms =
++        out->rollback_ms + out->replay_ms + out->final_commit_ms;
++    out->t_safe_total_ms =
++        (now_sec() - total_t0) * 1000.0 - out->diagnostic_ms;
++    out->total_ms = out->t_safe_total_ms;
++    out->timing_residual_ms =
++        out->t_safe_total_ms -
++        (out->t_verify_ms + out->rollback_ms +
++         out->replay_ms + out->final_commit_ms);
++
++    ds4_gpu_stream_expert_cache_get_stats(&stats1);
++    out->cache_hits =
++        stats1.hits >= stats0.hits ? stats1.hits - stats0.hits : 0;
++    out->cache_misses =
++        stats1.misses >= stats0.misses ? stats1.misses - stats0.misses : 0;
++    out->cache_evictions =
++        stats1.evictions >= stats0.evictions ?
++            stats1.evictions - stats0.evictions : 0;
++    out->pread_bytes =
++        stats1.pread_bytes >= stats0.pread_bytes ?
++            stats1.pread_bytes - stats0.pread_bytes : 0;
++    out->pread_ms =
++        stats1.pread_ms >= stats0.pread_ms ?
++            stats1.pread_ms - stats0.pread_ms : 0.0;
++
++    if (deep_check) {
++        /*
++         * Inject one wrong second candidate and require the verifier to expose
++         * the mismatch. The measured frontier is then restored and one exact
++         * decode is compared with the saved target step, testing atomic
++         * rollback rather than merely checking token-vector length.
++         */
++        s->checkpoint.len = start;
++        ds4_session_dspark_capture_invalidate(s);
++        if (ok) ok = spec_frontier_restore(&measured, s);
++        if (ok) {
++            memcpy(s->logits, start_logits, logits_bytes);
++            s->checkpoint_valid = true;
++        }
++        if (ok && block_size > 1u) {
++            int wrong[16];
++            memcpy(wrong, oracle, (size_t)block_size * sizeof(wrong[0]));
++            wrong[1] = sample_argmax(start_logits, DS4_N_VOCAB);
++            if (wrong[1] == oracle[1]) {
++                float best = -3.402823466e+38F;
++                int alt = -1;
++                for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
++                    if ((int)v == oracle[1]) continue;
++                    if (start_logits[v] > best) {
++                        best = start_logits[v];
++                        alt = (int)v;
++                    }
++                }
++                wrong[1] = alt;
++            }
++            for (uint32_t i = 0; i < block_size; i++) {
++                token_vec_push(&s->checkpoint, wrong[i]);
++            }
++            int wrong_tops[16] = {0};
++            ok = metal_graph_verify_suffix_tops(
++                    &s->graph,
++                    &e->model,
++                    &e->weights,
++                    &s->checkpoint,
++                    (uint32_t)start,
++                    block_size,
++                    false,
++                    false,
++                    wrong_tops,
++                    NULL,
++                    NULL);
++            const bool rejected = ok && wrong_tops[0] != wrong[1];
++            s->checkpoint.len = start;
++            ds4_session_dspark_capture_invalidate(s);
++            if (ok) ok = spec_frontier_restore(&measured, s);
++            if (ok) {
++                memcpy(s->logits, start_logits, logits_bytes);
++                s->checkpoint_valid = true;
++                ok = ds4_session_eval(s, oracle[0], err, errlen) == 0;
++            }
++            out->rollback_ok =
++                ok && rejected &&
++                sample_argmax(s->logits, DS4_N_VOCAB) ==
++                    sample_argmax(first_step_logits, DS4_N_VOCAB);
++        } else if (ok) {
++            out->rollback_ok = true;
++        }
++    } else {
++        out->rollback_ok = true;
++    }
++
++    s->checkpoint.len = start;
++    ds4_session_dspark_capture_invalidate(s);
++    if (!spec_frontier_restore(&measured, s)) ok = false;
++    memcpy(s->logits, start_logits, logits_bytes);
++    s->checkpoint_valid = ok;
++    spec_frontier_free(&measured);
++
++    if (!out->all_oracle_tokens_accepted ||
++        !out->final_argmax_equal ||
++        !out->continuation_equal ||
++        !out->rollback_ok) {
++        ok = false;
++        snprintf(err, errlen,
++                 "oracle verifier correctness check failed "
++                 "(batch_accepted=%d accepted=%d batch_argmax=%d "
++                 "final_argmax=%d "
++                 "continuation=%d rollback=%d "
++                 "max_abs=%.9g rmse=%.9g)",
++                 out->batch_all_oracle_tokens_accepted ? 1 : 0,
++                 out->all_oracle_tokens_accepted ? 1 : 0,
++                 out->batch_final_argmax_equal ? 1 : 0,
++                 out->final_argmax_equal ? 1 : 0,
++                 out->continuation_equal ? 1 : 0,
++                 out->rollback_ok ? 1 : 0,
++                 out->logits_max_abs,
++                 out->logits_rmse);
++    }
++
++oracle_verify_cleanup:
++    if (have_original) {
++        s->checkpoint.len = start;
++        ds4_session_dspark_capture_invalidate(s);
++        if (!spec_frontier_restore(&original, s)) ok = false;
++        memcpy(s->logits, start_logits, logits_bytes);
++        s->checkpoint_valid = ok;
++    }
++    spec_frontier_free(&original);
++    free(seq_cont_logits);
++    free(batch_cont_logits);
++    free(first_step_logits);
++    free(batch_logits);
++    free(sequential_logits);
++    free(start_logits);
++    return ok ? 0 : 1;
++#endif
++}
++
+ void ds4_session_invalidate(ds4_session *s) {
+     if (!s) return;
+     if (ds4_session_tp_leader(s) &&
+diff --git a/ds4.h b/ds4.h
+index 42bc116..8eef669 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -403,6 +403,81 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+                                         int max_tokens, int eos_token,
+                                         int *accepted, int accepted_cap,
+                                         char *err, size_t errlen);
++/*
++ * FARO Gate 4C-1 local research hook. It generates a greedy continuation with
++ * the target, restores the exact frontier, verifies the known-correct tokens
++ * as one block, checks the continuation state, and restores the caller's
++ * frontier before returning. It is inert unless called.
++ */
++typedef struct ds4_oracle_verify_result {
++    uint32_t timing_schema_version;
++    uint32_t block_size;
++    uint32_t committed_tokens;
++    uint32_t target_verify_calls;
++    uint32_t exact_replay_tokens;
++    uint32_t compressor_count_mismatch_layers;
++    uint32_t index_count_mismatch_layers;
++    uint32_t raw_kv_signature_mismatch_layers;
++    uint32_t attn_state_signature_mismatch_layers;
++    uint32_t index_state_signature_mismatch_layers;
++    uint32_t max_compressor_count_delta;
++    uint32_t max_index_count_delta;
++    uint64_t expert_requests;
++    uint64_t unique_experts;
++    uint64_t cache_hits;
++    uint64_t cache_misses;
++    uint64_t cache_evictions;
++    uint64_t pread_bytes;
++    double pread_ms;
++    double snapshot_ms;
++    double input_prepare_ms;
++    double upload_ms;
++    double layer_ms;
++    double head_ms;
++    double read_ms;
++    double final_logits_read_ms;
++    double compare_ms;
++    double state_check_ms;
++    double rollback_ms;
++    double replay_ms;
++    double final_commit_ms;
++    double diagnostic_ms;
++    double t_core_ms;
++    double t_verify_ms;
++    double t_verify_rollback_ms;
++    double t_safe_total_ms;
++    double timing_residual_ms;
++    double commit_ms;
++    double total_ms;
++    /* Batch verifier output versus the exact sequential reference. */
++    double logits_max_abs;
++    double logits_rmse;
++    /* Authoritative committed output versus the same exact reference. */
++    double final_logits_max_abs;
++    double final_logits_rmse;
++    bool batch_all_oracle_tokens_accepted;
++    bool all_oracle_tokens_accepted;
++    bool batch_final_argmax_equal;
++    bool final_argmax_equal;
++    bool continuation_equal;
++    bool rollback_ok;
++    bool batch_state_checked;
++    bool batch_state_reusable;
++    bool state_signature_checked;
++    bool frontier_position_equal;
++    bool compressor_metadata_equal;
++    bool auxiliary_frontier_metadata_equal;
++    bool used_exact_commit_replay;
++    bool timing_breakdown;
++    bool cold_cache;
++} ds4_oracle_verify_result;
++int ds4_session_oracle_verify_block(ds4_session *s,
++                                    uint32_t block_size,
++                                    bool cold_cache,
++                                    bool deep_check,
++                                    ds4_oracle_verify_result *out,
++                                    char *err,
++                                    size_t errlen);
+ /* TP worker side of a mirrored speculative-verify block: run its half of the
+  * batch verify for KV side effects, then obey the leader's commit frame
+  * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */
+diff --git a/ds4_gpu.h b/ds4_gpu.h
+index 2000bba..5ef56dd 100644
+--- a/ds4_gpu.h
++++ b/ds4_gpu.h
+@@ -148,6 +148,18 @@ void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
+ uint64_t ds4_gpu_recommended_working_set_size(void);
+ uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
+ uint32_t ds4_gpu_stream_expert_cache_current_count(void);
++typedef struct ds4_gpu_stream_expert_cache_stats {
++    uint64_t hits;
++    uint64_t misses;
++    uint64_t evictions;
++    uint64_t pread_bytes;
++    double   pread_ms;
++    uint32_t entries;
++    uint64_t resident_bytes;
++    uint64_t expert_bytes;
++} ds4_gpu_stream_expert_cache_stats;
++void ds4_gpu_stream_expert_cache_get_stats(
++        ds4_gpu_stream_expert_cache_stats *out);
+ typedef struct ds4_gpu_stream_expert_table {
+     const void *model_map;
+     uint64_t    model_size;
+diff --git a/ds4_metal.m b/ds4_metal.m
+index 39046ba..61c6dd1 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -10474,6 +10474,30 @@ uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
+     return g_stream_expert_cache_entry_count;
+ }
+ 
++void ds4_gpu_stream_expert_cache_release_resident(void) {
++    if (g_batch_cb) {
++        (void)ds4_gpu_end_commands();
++    } else {
++        (void)ds4_gpu_synchronize();
++    }
++    ds4_gpu_stream_expert_cache_clear_all(0);
++}
++
++void ds4_gpu_stream_expert_cache_get_stats(
++        ds4_gpu_stream_expert_cache_stats *out) {
++    if (!out) return;
++    *out = (ds4_gpu_stream_expert_cache_stats) {
++        .hits = g_stream_expert_cache_hits,
++        .misses = g_stream_expert_cache_misses,
++        .evictions = g_stream_expert_cache_evictions,
++        .pread_bytes = g_stream_expert_cache_pread_bytes,
++        .pread_ms = g_stream_expert_cache_pread_ms,
++        .entries = g_stream_expert_cache_entry_count,
++        .resident_bytes = g_stream_expert_cache_bytes,
++        .expert_bytes = g_stream_expert_cache_expert_bytes,
++    };
++}
++
+ uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
+         uint64_t gate_expert_bytes,
+         uint64_t down_expert_bytes) {
