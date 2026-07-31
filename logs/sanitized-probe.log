@@ -1,0 +1,12 @@
+FARO DS4 Gate 4C-2A sanitized probe
+DS4 base commit: MATCH
+Documentation says DSpark may use Metal SSD streaming: PRESENT
+Runtime rejects support model with SSD streaming: PRESENT
+Oracle candidates: VALID
+Frontier position: MATCH
+Compressor counters: MATCH
+Raw KV state: DIFFERENT
+Attention compressor state: DIFFERENT
+Index compressor state: DIFFERENT
+Replay-safe final logits: EXACT MATCH
+No model path, prompt text, generated output, token identifier or tensor dump is included.

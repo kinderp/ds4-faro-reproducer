@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If this reproducer helps your investigation, cite this repository."
+title: "FARO DS4 Gate 4C-2A Reproducer"
+type: software
+version: "1.0.0"
+date-released: "2026-07-31"
+authors:
+  - name: "FARO contributors"
+repository-code: "https://github.com/kinderp/ds4-faro-reproducer"
+license: MIT
+keywords:
+  - DS4
+  - Metal
+  - SSD streaming
+  - speculative verification
+  - KV cache
+  - reproducibility

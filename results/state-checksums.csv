@@ -1,0 +1,5 @@
+category,block_size,frontier_position,compressor_counters,raw_kv_mismatch_layers,attention_state_mismatch_layers,index_state_mismatch_layers,replay_final_logits
+coding_predictable,6,MATCH,MATCH,42,41,21,EXACT MATCH
+coding_less_predictable,6,MATCH,MATCH,43,41,21,EXACT MATCH
+structured_prose,6,MATCH,MATCH,42,41,21,EXACT MATCH
+reasoning,6,MATCH,MATCH,41,41,21,EXACT MATCH
