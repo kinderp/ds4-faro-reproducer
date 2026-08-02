@@ -1,0 +1,127 @@
+{
+  "schema_version": "1.0",
+  "gate_id": "RF_E2_LAYER_CRITICAL_PATH",
+  "gate_status": "PASS",
+  "evidence": {
+    "scope": "SINGLE_HOST",
+    "level": "E1",
+    "usable_real_runs": 6,
+    "overhead_runs": 4,
+    "telemetry_overhead_percent_median": 0.3623,
+    "telemetry_intrusiveness": "ACCEPTABLE",
+    "output_equivalence_verified": true
+  },
+  "environment": {
+    "hardware": "Apple M4 Max",
+    "unified_memory_gib": 36,
+    "backend": "Metal",
+    "ds4_upstream_commit": "54b36ed9ba42da31b24f2d1a5feb075c2475dbb1",
+    "ds4_rf_e_commit": "cab90ed992c7427bbee4d9d7e0d5cbbe190185b0",
+    "ds4_rf_e2_commit": "3ae659316268b8429078bd455d2a9bac54779e14",
+    "model_size_bytes": 86720111488,
+    "model_sha256": "efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668",
+    "binary_sha256": "75dab09f2aa787538b03bf1f86706e34e82dd1f323938fecdd4adf724f3e357d",
+    "context_size": 1024,
+    "generated_tokens": 128,
+    "temperature": 0,
+    "thinking_enabled": false,
+    "mtp_enabled": false,
+    "dspark_enabled": false,
+    "speculation_enabled": false
+  },
+  "timing_definitions": {
+    "T0": "selected expert IDs available on the host",
+    "T1": "cache lookup complete",
+    "T2": "first required I/O starts",
+    "T3": "all required expert cache slots ready",
+    "T4": "host-side bookkeeping and synchronization complete; MoE compute dispatch-ready",
+    "host_addressable_time": "host-side work potentially reducible, bypassable or overlap-capable; excludes the assumption that physical SSD service becomes faster",
+    "post_ready_dispatch": "T3 to T4: time after all required expert data is ready but before MoE compute can be dispatched"
+  },
+  "per_cache": {
+    "256": {
+      "layer_calls": 10320,
+      "all_hit_calls": 2,
+      "miss_bearing_calls": 10318,
+      "all_hit_layer_rate": 0.0001937984,
+      "miss_bearing_layer_rate": 0.9998062016,
+      "miss_count_histogram_0_to_6": [2, 98, 544, 1472, 2674, 3196, 2334],
+      "physical_load_histogram_0_to_6": [2, 98, 544, 1472, 2674, 3196, 2334],
+      "coalesced_waiters": 0,
+      "mean_t0_to_t2_ms_per_miss_bearing_layer": 0.609,
+      "mean_t2_to_t3_ms_per_miss_bearing_layer": 1.303,
+      "mean_t3_to_t4_ms_per_layer": 0.017,
+      "host_addressable_ms_per_token": 26.222,
+      "host_addressable_fraction": 0.1896,
+      "bytes_per_token_gib": 1.271,
+      "decode_tokens_per_second_median": 6.645,
+      "physical_footprint_gib_median": 2.002
+    },
+    "760": {
+      "layer_calls": 10320,
+      "all_hit_calls": 262,
+      "miss_bearing_calls": 10058,
+      "all_hit_layer_rate": 0.0253875969,
+      "miss_bearing_layer_rate": 0.9746124031,
+      "miss_count_histogram_0_to_6": [262, 960, 2118, 2716, 2318, 1462, 484],
+      "physical_load_histogram_0_to_6": [262, 960, 2118, 2716, 2318, 1462, 484],
+      "coalesced_waiters": 0,
+      "mean_t0_to_t2_ms_per_miss_bearing_layer": 0.632,
+      "mean_t2_to_t3_ms_per_miss_bearing_layer": 1.412,
+      "mean_t3_to_t4_ms_per_layer": 0.022,
+      "host_addressable_ms_per_token": 26.534,
+      "host_addressable_fraction": 0.1863,
+      "bytes_per_token_gib": 0.902,
+      "decode_tokens_per_second_median": 6.450,
+      "physical_footprint_gib_median": 5.314
+    },
+    "1521": {
+      "layer_calls": 10320,
+      "all_hit_calls": 2132,
+      "miss_bearing_calls": 8188,
+      "all_hit_layer_rate": 0.2065891473,
+      "miss_bearing_layer_rate": 0.7934108527,
+      "miss_count_histogram_0_to_6": [2132, 2830, 2576, 1704, 698, 310, 70],
+      "physical_load_histogram_0_to_6": [2132, 2830, 2576, 1704, 698, 310, 70],
+      "coalesced_waiters": 0,
+      "mean_t0_to_t2_ms_per_miss_bearing_layer": 0.679,
+      "mean_t2_to_t3_ms_per_miss_bearing_layer": 1.660,
+      "mean_t3_to_t4_ms_per_layer": 0.007,
+      "host_addressable_ms_per_token": 23.320,
+      "host_addressable_fraction": 0.1683533271,
+      "bytes_per_token_gib": 0.490,
+      "decode_tokens_per_second_median": 6.310,
+      "physical_footprint_gib_median": 10.334
+    }
+  },
+  "wait_by_miss_count_ms_mean": {
+    "0": 0.0,
+    "1": 1.094,
+    "2": 1.728,
+    "3": 2.116,
+    "4": 2.279,
+    "5": 2.529,
+    "6": 2.812
+  },
+  "critical_path_by_miss_count_ms_mean": {
+    "0": 0.015,
+    "1": 1.096,
+    "2": 1.730,
+    "3": 2.128,
+    "4": 2.302,
+    "5": 2.577,
+    "6": 2.814
+  },
+  "classifications": {
+    "layer_critical_path": "MISS_COUNT_SCALING",
+    "gpu_resident_kernel_relevance": "PROMISING",
+    "next_architecture_priority": "GPU_DRIVEN_IO_SPIKE"
+  },
+  "limitations": [
+    "Single host, prompt and session with two measured runs per cache size.",
+    "The synchronous pread path does not expose submit and physical service as fully separable intervals.",
+    "GPU compute time and maximum individual read-tail latency were not measured.",
+    "Host-addressable fraction is an upper bound on redesignable time, not an expected speedup.",
+    "No persistent kernel, GPU-originated queue, prefetch or fine-grained paging was implemented."
+  ]
+}
