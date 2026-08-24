@@ -1,5 +1,10 @@
 # Upstream audit
 
+> Historical baseline audit: this file describes DS4 at
+> `54b36ed9ba42da31b24f2d1a5feb075c2475dbb1`. It is intentionally preserved
+> as evidence of the state observed at that revision. For the current upstream
+> status as of 2026-08-24, see [`UPSTREAM_WATCH_2026-08-24.md`](UPSTREAM_WATCH_2026-08-24.md).
+
 The FARO base and fetched DS4 `origin/main` were both:
 
 ```text
